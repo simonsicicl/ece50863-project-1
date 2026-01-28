@@ -7,6 +7,8 @@ Last Modified Date: December 9th, 2021
 """
 
 import sys
+import socket
+import heapq
 from datetime import date, datetime
 
 # Please do not modify the name of the log file, otherwise you will lose points because the grader won't be able to find your log file
@@ -115,6 +117,125 @@ def main():
         sys.exit(1)
     
     # Write your code below or elsewhere in this file
+
+    # Parameters
+    port = int(sys.argv[1])
+    config = sys.argv[2]
+
+    # Variables
+    switch_cnt = 0
+    switch_addresses = {}
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(('', port))
+    topology = {}
+    
+    # Read Configuration
+    try:
+        with open(config, 'r') as f:
+            lines = [l.strip() for l in f.readlines() if l.strip()]
+            switch_cnt = int(lines[0])
+            topology = {i: {} for i in range(switch_cnt)}
+            
+            for line in lines[1:]:
+                parts = line.split()
+                if len(parts) < 3: continue
+                u, v, dist = int(parts[0]), int(parts[1]), int(parts[2])
+                topology[u][v] = dist
+                topology[v][u] = dist
+    except Exception as e:
+        print(f"Error read file: {e}")
+        sys.exit(1)
+    
+    # Wait for Registration
+    while len(switch_addresses) < switch_cnt:
+        data, addr = sock.recvfrom(4096)
+        parts = data.decode().strip().split()
+        if len(parts) >= 2 and parts[1] == "Register_Request":
+            switch_id = int(parts[0])
+            if switch_id not in switch_addresses:
+                register_request_received(switch_id)
+            switch_addresses[switch_id] = addr
+
+    # Send Register Response
+    for switch_id in range(switch_cnt):
+         neighbors = topology[switch_id]
+         response_lines = []
+         
+         valid_neighbors = []
+         for neighbor_id in neighbors:
+             if neighbor_id in switch_addresses:
+                 nb_addr = switch_addresses[neighbor_id]
+                 valid_neighbors.append(f"{neighbor_id} {nb_addr[0]} {nb_addr[1]}")
+         
+         response_lines.append("REGISTER_RESPONSE")
+         response_lines.append(str(len(valid_neighbors)))
+         response_lines.extend(valid_neighbors)
+         
+         response_msg = "\n".join(response_lines)
+         sock.sendto(response_msg.encode(), switch_addresses[switch_id])
+         register_response_sent(switch_id)
+
+    # Routing Table Calculation
+    all_routes_log = []
+    switch_routing_tables = {i: [] for i in range(switch_cnt)}
+
+    for src in range(switch_cnt):
+        # Dijkstra's Algorithm
+        dists = {i: float('inf') for i in range(switch_cnt)}
+        dists[src] = 0
+        parents = {i: None for i in range(switch_cnt)}
+        pq = [(0, src)]
+        visited = set()
+        
+        while pq:
+            d, u = heapq.heappop(pq)
+            if u in visited:
+                continue
+            visited.add(u)
+            if d > dists[u]:
+                continue
+            for v, weight in topology[u].items():
+                if dists[u] + weight < dists[v]:
+                    dists[v] = dists[u] + weight
+                    parents[v] = u
+                    heapq.heappush(pq, (dists[v], v))
+        
+        # Construct Routing Table
+        for dest in range(switch_cnt):
+            next_hop = -1
+            dist_val = 9999
+            
+            if dest == src:
+                next_hop = src
+                dist_val = 0
+            elif dists[dest] == float('inf'):
+                next_hop = -1
+                dist_val = 9999
+            else:
+                dist_val = dists[dest]
+                next_hop = dest
+                while parents[next_hop] != src and parents[next_hop] is not None:
+                    next_hop = parents[next_hop]
+            
+            all_routes_log.append([src, dest, next_hop, dist_val])
+            switch_routing_tables[src].append(f"{dest} {next_hop} {dist_val}")
+
+    routing_table_update(all_routes_log)
+
+    # Send Route Updates to Switches
+    for switch_id in range(switch_cnt):
+        lines = []
+        lines.append("ROUTE_UPDATE")
+        lines.append(str(switch_id)) 
+        lines.extend(switch_routing_tables[switch_id])
+        sock.sendto("\n".join(lines).encode(), switch_addresses[switch_id])
+
+    while True:
+        try:
+             data, addr = sock.recvfrom(4096)
+        except KeyboardInterrupt:
+            break
+
 
 if __name__ == "__main__":
     main()

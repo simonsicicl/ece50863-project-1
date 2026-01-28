@@ -7,6 +7,7 @@ Last Modified Date: December 9th, 2021
 """
 
 import sys
+import socket
 from datetime import date, datetime
 
 # Please do not modify the name of the log file, otherwise you will lose points because the grader won't be able to find your log file
@@ -101,6 +102,40 @@ def main():
     LOG_FILE = 'switch' + str(my_id) + ".log" 
 
     # Write your code below or elsewhere in this file
+
+    # Parameters
+    ctrl_host = sys.argv[2]
+    ctrl_port = int(sys.argv[3])
+
+    # Variables
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(('', 0))
+    controller_addr = (ctrl_host, ctrl_port)
+    
+    # Register Request
+    msg = f"{my_id} Register_Request"
+    sock.sendto(msg.encode(), controller_addr)
+    register_request_sent()
+    
+    # 2. Loop to handle messages
+    while True:
+        try:
+            data, addr = sock.recvfrom(4096)
+            lines = data.decode().strip().split('\n')
+            if len(lines) > 0:
+                if lines[0] == "REGISTER_RESPONSE":
+                    register_response_received()
+                elif lines[0] == "ROUTE_UPDATE":
+                    new_routing_table = []
+                    for line in lines[2:]:
+                        parts = line.split()
+                        new_routing_table.append([my_id, int(parts[0]), int(parts[1])])
+                    routing_table_update(new_routing_table)    
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            print(f"Error: {e}")
+            pass
 
 if __name__ == "__main__":
     main()
