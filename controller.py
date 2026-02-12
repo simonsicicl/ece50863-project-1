@@ -241,28 +241,21 @@ def main():
 
                     if sid not in alive_switches:
                         alive_switches.add(sid)
-                        topology_update_switch_alive(sid)
-                        # Reset neighbor reports for this switch (optimistic: all alive)
+                        topology_update_switch_alive(sid)s
                         neighbor_reports[sid] = {}
-                        for nid in topology.get(sid, {}):
+                        for nid in topology.get(sid, {}):   # Reset this report
                             neighbor_reports[sid][nid] = True
-                        # Also reset other switches' reports about this switch
-                        for other_sid in alive_switches:
+                        for other_sid in alive_switches:    # Reset others reports
                             if sid in neighbor_reports.get(other_sid, {}):
                                 neighbor_reports[other_sid][sid] = True
-                        # Clear dead links involving this switch
-                        dead_links.difference_update(
-                            {lk for lk in dead_links if sid in lk}
-                        )
-                    # Send Register Response
+                        dead_links.difference_update({lk for lk in dead_links if sid in lk}) # Clear dead links
+                    # Send Register Response and recompute routes
                     send_register_response(sid)
                     register_response_sent(sid)
-                    # Recompute and send routes
                     compute_and_send_routes()
                 elif msg_lines[0] == "TOPOLOGY_UPDATE":
                     sid = int(msg_lines[1])
                     last_heard[sid] = time.time()
-                    # Update neighbor reports
                     for line in msg_lines[2:]:
                         lparts = line.split()
                         if len(lparts) >= 2:
@@ -293,16 +286,13 @@ def main():
                     for nid, is_alive in neighbor_reports.get(sid, {}).items():
                         if nid in alive_switches and not is_alive:
                             cur_dead_links.add((min(sid, nid), max(sid, nid)))
-                # New dead links
-                for lk in cur_dead_links - dead_links:
+                for lk in cur_dead_links - dead_links:  # New dead links
                     topology_update_link_dead(lk[0], lk[1])
                     changed = True
-                # Revived links
-                if dead_links - cur_dead_links:
+                if dead_links - cur_dead_links:         # Links that came back alive# Revived links
                     changed = True
                 dead_links.clear()
                 dead_links.update(cur_dead_links)
-                # Recompute routes if topology changed
                 if changed:
                     compute_and_send_routes()
     
@@ -340,12 +330,12 @@ def main():
             alive_switches.add(sid)
             last_heard[sid] = time.time()
 
-    # Send Register Responses to all switches
+    # Send Register Responses to all
     for sid in range(switch_cnt):
         send_register_response(sid)
         register_response_sent(sid)
 
-    # Initialize neighbor reports (all neighbors alive)
+    # Initialize neighbor reports
     for sid in range(switch_cnt):
         neighbor_reports[sid] = {}
         for nid in topology.get(sid, {}):
@@ -363,7 +353,7 @@ def main():
     recv_thread.start()
     per_thread.start()
 
-    # Keep main thread alive
+    # Keep alive
     try:
         while True:
             time.sleep(1)

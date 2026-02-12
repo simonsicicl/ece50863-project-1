@@ -154,7 +154,6 @@ def main():
 
             with lock:
                 if lines[0] == "ROUTE_UPDATE":
-                    # Parse and log routing table
                     table = []
                     for line in lines[2:]:
                         parts = line.split()
@@ -162,7 +161,6 @@ def main():
                     routing_table_update(table)
 
                 elif lines[0] == "REGISTER_RESPONSE":
-                    # Handle re-registration response
                     register_response_received()
                     num_nb = int(lines[1])
                     nb_addrs.clear()
@@ -182,18 +180,15 @@ def main():
                         nb_last_ka[nid] = now
 
                 else:
-                    # Check for KEEP_ALIVE message
                     parts = lines[0].split()
                     if len(parts) >= 2 and parts[1] == "KEEP_ALIVE":
                         sender_id = int(parts[0])
-                        # Ignore if from failed-link neighbor
                         if failed_neighbor is not None and sender_id == failed_neighbor:
                             continue
                         if sender_id in nb_alive:
                             nb_last_ka[sender_id] = time.time()
                             nb_addrs[sender_id] = addr  # update address
-                            if not nb_alive[sender_id]:
-                                # Neighbor came back alive
+                            if not nb_alive[sender_id]: # Neighbor came back alive
                                 nb_alive[sender_id] = True
                                 neighbor_alive(sender_id)
                                 send_topo_update()
@@ -206,7 +201,7 @@ def main():
                 now = time.time()
                 topo_changed = False
 
-                # Check for dead neighbors (timeout)
+                # Check for dead neighbors
                 for nid in list(nb_alive.keys()):
                     if nb_alive[nid]:
                         if now - nb_last_ka.get(nid, 0) > TIMEOUT:
@@ -214,7 +209,7 @@ def main():
                             neighbor_dead(nid)
                             topo_changed = True
 
-                # Send KEEP_ALIVE to alive neighbors
+                # Send KEEP_ALIVE
                 for nid in nb_alive:
                     if nb_alive[nid]:
                         if failed_neighbor is not None and nid == failed_neighbor:
@@ -224,7 +219,7 @@ def main():
                                 sock.sendto(f"{my_id} KEEP_ALIVE".encode(), nb_addrs[nid])
                             except (ConnectionResetError, OSError):
                                 pass
-                # Send Topology Update to Controller
+                # Send Update
                 send_topo_update()
 
     # ============================================
@@ -259,7 +254,7 @@ def main():
     recv_thread.start()
     per_thread.start()
 
-    # Keep main thread alive
+    # Keep alive
     try:
         while True:
             time.sleep(1)
