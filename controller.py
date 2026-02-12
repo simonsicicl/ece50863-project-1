@@ -9,10 +9,14 @@ Last Modified Date: December 9th, 2021
 import sys
 import socket
 import heapq
+import threading
+import time
 from datetime import date, datetime
 
 # Please do not modify the name of the log file, otherwise you will lose points because the grader won't be able to find your log file
 LOG_FILE = "Controller.log"
+K = 2
+TIMEOUT = 3 * K
 
 # Those are logging functions to help you follow the correct logging standard
 
@@ -127,8 +131,183 @@ def main():
     switch_addresses = {}
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(('', port))
+    sock.settimeout(1.0)
     topology = {}
+    alive_switches = set() 
+    last_heard = {} 
+    neighbor_reports = {}
+    dead_links = set()          
+    lock = threading.Lock()
+
+    # ========== Functions ==========
+
+    def send_register_response(sid):
+        """Send Register Response to a switch with all its configured neighbors."""
+        neighbors = topology.get(sid, {})
+        resp_lines = ["REGISTER_RESPONSE", str(len(neighbors))]
+        for nid in sorted(neighbors.keys()):
+            if nid in alive_switches and nid in switch_addresses:
+                na = switch_addresses[nid]
+                resp_lines.append(f"{nid} True {na[0]} {na[1]}")
+            else:
+                resp_lines.append(f"{nid} False")
+        sock.sendto("\n".join(resp_lines).encode(), switch_addresses[sid])
+
+    def compute_routes():
+        """Compute shortest paths using Dijkstra on the effective topology."""
+        eff_topo = {}
+        for sid in alive_switches:
+            eff_topo[sid] = {}
+            for nid, dist in topology.get(sid, {}).items():
+                if nid in alive_switches:
+                    lk = (min(sid, nid), max(sid, nid))
+                    if lk not in dead_links:
+                        eff_topo[sid][nid] = dist
+
+        all_routes = []
+        switch_tables = {}
+
+        for src in sorted(alive_switches):
+            switch_tables[src] = []
+
+            # Dijkstra
+            dists = {s: float('inf') for s in alive_switches}
+            dists[src] = 0
+            parents = {s: None for s in alive_switches}
+            pq = [(0, src)]
+            visited = set()
+
+            while pq:
+                d, u = heapq.heappop(pq)
+                if u in visited:
+                    continue
+                visited.add(u)
+                for v, w in eff_topo.get(u, {}).items():
+                    if v not in visited and dists[u] + w < dists[v]:
+                        dists[v] = dists[u] + w
+                        parents[v] = u
+                        heapq.heappush(pq, (dists[v], v))
+
+            # Build routing table entries for this source
+            for dest in range(switch_cnt):
+                if dest == src:
+                    all_routes.append([src, dest, src, 0])
+                    switch_tables[src].append(f"{dest} {src} 0")
+                elif dest not in alive_switches or dists.get(dest, float('inf')) == float('inf'):
+                    all_routes.append([src, dest, -1, 9999])
+                    switch_tables[src].append(f"{dest} -1 9999")
+                else:
+                    d_val = dists[dest]
+                    nh = dest
+                    while parents[nh] is not None and parents[nh] != src:
+                        nh = parents[nh]
+                    all_routes.append([src, dest, nh, d_val])
+                    switch_tables[src].append(f"{dest} {nh} {d_val}")
+
+        return all_routes, switch_tables
+
+    def compute_and_send_routes():
+        """Compute routes, log them, and send to all alive switches."""
+        all_routes, switch_tables = compute_routes()
+        routing_table_update(all_routes)
+        for sid in alive_switches:
+            if sid in switch_addresses and sid in switch_tables:
+                msg_lines = ["ROUTE_UPDATE", str(sid)]
+                msg_lines.extend(switch_tables[sid])
+                sock.sendto("\n".join(msg_lines).encode(), switch_addresses[sid])
     
+    def receiver():
+        """Thread to receive messages from switches."""
+        while True:
+            try:
+                data, addr = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except ConnectionResetError:
+                continue
+            except OSError:
+                break
+
+            msg = data.decode().strip()
+            msg_lines = msg.split('\n')
+
+            with lock:
+                first_parts = msg_lines[0].split()
+                if len(first_parts) >= 2 and first_parts[1] == "Register_Request":
+                    sid = int(first_parts[0])
+                    register_request_received(sid)
+                    switch_addresses[sid] = addr
+                    last_heard[sid] = time.time()
+
+                    if sid not in alive_switches:
+                        alive_switches.add(sid)
+                        topology_update_switch_alive(sid)
+                        # Reset neighbor reports for this switch (optimistic: all alive)
+                        neighbor_reports[sid] = {}
+                        for nid in topology.get(sid, {}):
+                            neighbor_reports[sid][nid] = True
+                        # Also reset other switches' reports about this switch
+                        for other_sid in alive_switches:
+                            if sid in neighbor_reports.get(other_sid, {}):
+                                neighbor_reports[other_sid][sid] = True
+                        # Clear dead links involving this switch
+                        dead_links.difference_update(
+                            {lk for lk in dead_links if sid in lk}
+                        )
+                    # Send Register Response
+                    send_register_response(sid)
+                    register_response_sent(sid)
+                    # Recompute and send routes
+                    compute_and_send_routes()
+                elif msg_lines[0] == "TOPOLOGY_UPDATE":
+                    sid = int(msg_lines[1])
+                    last_heard[sid] = time.time()
+                    # Update neighbor reports
+                    for line in msg_lines[2:]:
+                        lparts = line.split()
+                        if len(lparts) >= 2:
+                            nid = int(lparts[0])
+                            is_alive = lparts[1] == "True"
+                            neighbor_reports.setdefault(sid, {})[nid] = is_alive
+
+    def periodic():
+        """Thread to periodically check switch and link status."""
+        while True:
+            time.sleep(K)
+            with lock:
+                now = time.time()
+                changed = False
+                # Detect dead switches
+                newly_dead = []
+                for sid in list(alive_switches):
+                    if now - last_heard.get(sid, 0) > TIMEOUT:
+                        newly_dead.append(sid)
+                for sid in newly_dead:
+                    alive_switches.discard(sid)
+                    topology_update_switch_dead(sid)
+                    dead_links.difference_update({lk for lk in dead_links if sid in lk})
+                    changed = True
+                # Detect link changes among alive switches
+                cur_dead_links = set()
+                for sid in alive_switches:
+                    for nid, is_alive in neighbor_reports.get(sid, {}).items():
+                        if nid in alive_switches and not is_alive:
+                            cur_dead_links.add((min(sid, nid), max(sid, nid)))
+                # New dead links
+                for lk in cur_dead_links - dead_links:
+                    topology_update_link_dead(lk[0], lk[1])
+                    changed = True
+                # Revived links
+                if dead_links - cur_dead_links:
+                    changed = True
+                dead_links.clear()
+                dead_links.update(cur_dead_links)
+                # Recompute routes if topology changed
+                if changed:
+                    compute_and_send_routes()
+    
+    # ============================================
+
     # Read Configuration
     try:
         with open(config, 'r') as f:
@@ -148,93 +327,48 @@ def main():
     
     # Wait for Registration
     while len(switch_addresses) < switch_cnt:
-        data, addr = sock.recvfrom(4096)
-        parts = data.decode().strip().split()
-        if len(parts) >= 2 and parts[1] == "Register_Request":
-            switch_id = int(parts[0])
-            if switch_id not in switch_addresses:
-                register_request_received(switch_id)
-            switch_addresses[switch_id] = addr
-
-    # Send Register Response
-    for switch_id in range(switch_cnt):
-         neighbors = topology[switch_id]
-         response_lines = []
-         
-         valid_neighbors = []
-         for neighbor_id in neighbors:
-             if neighbor_id in switch_addresses:
-                 nb_addr = switch_addresses[neighbor_id]
-                 valid_neighbors.append(f"{neighbor_id} {nb_addr[0]} {nb_addr[1]}")
-         
-         response_lines.append("REGISTER_RESPONSE")
-         response_lines.append(str(len(valid_neighbors)))
-         response_lines.extend(valid_neighbors)
-         
-         response_msg = "\n".join(response_lines)
-         sock.sendto(response_msg.encode(), switch_addresses[switch_id])
-         register_response_sent(switch_id)
-
-    # Routing Table Calculation
-    all_routes_log = []
-    switch_routing_tables = {i: [] for i in range(switch_cnt)}
-
-    for src in range(switch_cnt):
-        # Dijkstra's Algorithm
-        dists = {i: float('inf') for i in range(switch_cnt)}
-        dists[src] = 0
-        parents = {i: None for i in range(switch_cnt)}
-        pq = [(0, src)]
-        visited = set()
-        
-        while pq:
-            d, u = heapq.heappop(pq)
-            if u in visited:
-                continue
-            visited.add(u)
-            if d > dists[u]:
-                continue
-            for v, weight in topology[u].items():
-                if dists[u] + weight < dists[v]:
-                    dists[v] = dists[u] + weight
-                    parents[v] = u
-                    heapq.heappush(pq, (dists[v], v))
-        
-        # Construct Routing Table
-        for dest in range(switch_cnt):
-            next_hop = -1
-            dist_val = 9999
-            
-            if dest == src:
-                next_hop = src
-                dist_val = 0
-            elif dists[dest] == float('inf'):
-                next_hop = -1
-                dist_val = 9999
-            else:
-                dist_val = dists[dest]
-                next_hop = dest
-                while parents[next_hop] != src and parents[next_hop] is not None:
-                    next_hop = parents[next_hop]
-            
-            all_routes_log.append([src, dest, next_hop, dist_val])
-            switch_routing_tables[src].append(f"{dest} {next_hop} {dist_val}")
-
-    routing_table_update(all_routes_log)
-
-    # Send Route Updates to Switches
-    for switch_id in range(switch_cnt):
-        lines = []
-        lines.append("ROUTE_UPDATE")
-        lines.append(str(switch_id)) 
-        lines.extend(switch_routing_tables[switch_id])
-        sock.sendto("\n".join(lines).encode(), switch_addresses[switch_id])
-
-    while True:
         try:
-             data, addr = sock.recvfrom(4096)
-        except KeyboardInterrupt:
-            break
+            data, addr = sock.recvfrom(4096)
+        except socket.timeout:
+            continue
+        msg = data.decode().strip()
+        parts = msg.split()
+        if len(parts) >= 2 and parts[1] == "Register_Request":
+            sid = int(parts[0])
+            register_request_received(sid)
+            switch_addresses[sid] = addr
+            alive_switches.add(sid)
+            last_heard[sid] = time.time()
+
+    # Send Register Responses to all switches
+    for sid in range(switch_cnt):
+        send_register_response(sid)
+        register_response_sent(sid)
+
+    # Initialize neighbor reports (all neighbors alive)
+    for sid in range(switch_cnt):
+        neighbor_reports[sid] = {}
+        for nid in topology.get(sid, {}):
+            neighbor_reports[sid][nid] = True
+
+    # Update last_heard after responses sent and send initial routes
+    now = time.time()
+    for sid in range(switch_cnt):
+        last_heard[sid] = now
+    compute_and_send_routes()
+
+    # Start Threads
+    recv_thread = threading.Thread(target=receiver, daemon=True)
+    per_thread = threading.Thread(target=periodic, daemon=True)
+    recv_thread.start()
+    per_thread.start()
+
+    # Keep main thread alive
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
